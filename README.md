@@ -1,7 +1,7 @@
 # Scripts
 
 High-performance computing scripts for the [ATAC-seq pipeline](https://github.com/reskejak/ATAC-seq) developed by [
-Jake Reske](https://github.com/reskejak). See [below](#atac-seq-original-readme) For [PBS job scheduler](https://en.wikipedia.org/wiki/Portable_Batch_System), but easily modifiable for other systems. Each script implements steps and sub-steps outlined in the [workflow schema](https://github.com/reskejak/ATAC-seq#atacseq_workflowtxt).
+Jake Reske](https://github.com/reskejak). See [below](#atac-seq-original-readme) how to cite this pipeline. Adapted for [PBS job scheduler](https://en.wikipedia.org/wiki/Portable_Batch_System), but easily modifiable for other systems. Each script implements steps and sub-steps outlined in the [workflow schema](https://github.com/reskejak/ATAC-seq#atacseq_workflowtxt).
 
 Prerequisites: Tools must be installed within [Conda](https://docs.conda.io/en/latest/miniconda.html) environment. I prefer to install tools in separate environments. E.g., for [bowtie2](https://bowtie-bio.sourceforge.net/bowtie2/index.shtml):
 
