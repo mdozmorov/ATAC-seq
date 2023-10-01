@@ -1,0 +1,795 @@
+---
+title: "ChIP-seq Analysis"
+author: "Mikhail Dozmorov"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: cerulean
+    toc: yes
+  pdf_document:
+    toc: no
+---
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+# Set up the environment
+library(knitr)
+opts_chunk$set(cache.path='cache/', fig.path='img/', cache=F, tidy=T, fig.keep='high', echo=F, dpi=100, warnings=F, message=F, comment=NA, warning=F, results='as.is', fig.width = 10, fig.height = 6) #out.width=700, 
+library(pander)
+panderOptions('table.split.table', Inf)
+set.seed(1)
+library(dplyr)
+options(stringsAsFactors = FALSE)
+```
+
+# Analysis of ChIP-seq data in R and Bioconductor
+
+https://rockefelleruniversity.github.io/RU_ATAC_Workshop.html
+
+# Libraries
+
+```{r libraries}
+library(tidyverse)
+library(Rsubread)
+library(Rsamtools)
+library(GenomicAlignments)
+library(soGGi)
+library(ChIPQC)
+library(rtracklayer)
+library(DT)
+library(tidyr)
+library(ChIPseeker)
+library(rGREAT)
+library(limma)
+library(DESeq2)
+library(tracktables)
+library(clusterProfiler)
+library(MotifDb)
+library(Biostrings)
+library(grid)
+library(gridExtra)
+library(annotables) # devtools::install_github("stephenturner/annotables") Annotations of Ensembl IDs
+library(biomaRt)
+library(writexl)
+library(readxl)
+library(readr)
+library(ChIPpeakAnno)
+library(ggrepel)
+```
+
+# Settings
+
+```{r settings}
+# Project folder
+dir_data <- "/Users/mdozmorov/Documents/Data/VCU_work/Tony/2023-06.ATAC-seq"
+# Create subfolders, if not exist
+if (!dir.exists(file.path(dir_data, "memes"))) dir.create(file.path(dir_data, "memes"))
+if (!dir.exists(file.path(dir_data, "results"))) dir.create(file.path(dir_data, "results"))
+p_val_cutoff   <- 0.05 # Regular p-value cutoff
+p_adj_cutoff   <- 0.3 # FDR cutoff
+rerun          <- FALSE # Rerun all analyses?
+up_dn_separate <- TRUE # Whether to run KEGG separately on up- and downregulated 
+pairedend      <- TRUE # Whether the library is paired end
+# Run on promoters, or the union of ChIP-seq peaks?
+run_promoters  <- TRUE
+# Promoter definition
+upstream <- 3000 
+dnstream <- 500
+# Minimum number of genes for KEGG analysis
+min_genes <- 10
+# Threads
+threads <- 4
+```
+```{r}
+# Human/mouse selection
+human <- TRUE
+mouse <- FALSE
+if (human) {
+  library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  TxDb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+  # annoData <- toGRanges(TxDb, feature="gene")
+  library("EnsDb.Hsapiens.v86")
+  annoData <- toGRanges(EnsDb.Hsapiens.v86, feature="gene")
+  library("org.Hs.eg.db")
+  OrgDb <- "org.Hs.eg.db"
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  BSgenome <- BSgenome.Hsapiens.UCSC.hg38
+  TSSs <- resize(genes(TxDb.Hsapiens.UCSC.hg38.knownGene), fix = "start", 1)
+  autosomes <- c("chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chrX", "chrY")
+  seqlevels(TSSs, pruning.mode = "tidy") <- autosomes
+  # hg38 blacklisted: https://www.encodeproject.org/annotations/ENCSR636HFF/
+  # wget https://www.encodeproject.org/files/ENCFF356LFX/@@download/ENCFF356LFX.bed.gz
+  fileNameBlacklisted <- "ENCFF356LFX.bed.gz"
+  annot <- "hg38" # for QCmetrics
+  organism <- "hsa" # for enrichKEGG
+  gene_annotations <- grch38[ !(grepl("_", grch38$chr) | grepl("GL", grch38$chr)), c("ensgene", "symbol", "biotype", "description")]
+  gene_annotations <- gene_annotations[ !duplicated(gene_annotations) & !is.na(gene_annotations$symbol), ]
+  # for biomaRt
+  mart <- useMart("ensembl", dataset="hsapiens_gene_ensembl")
+  gene_symbol <- 'hgnc_symbol'
+}
+if (mouse) {
+  library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+  TxDb <- TxDb.Mmusculus.UCSC.mm10.knownGene
+  OrgDb <- "org.Mm.eg.db"
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  BSgenome <- BSgenome.Mmusculus.UCSC.mm10
+  TSSs <- resize(genes(TxDb.Mmusculus.UCSC.mm10.knownGene), fix = "start", 1)
+  autosomes <- c("chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chrX", "chrY")
+  seqlevels(TSSs, pruning.mode = "tidy") <- autosomes
+  # mm10 blacklisted: https://www.encodeproject.org/annotations/ENCSR636HFF/
+  # wget https://www.encodeproject.org/files/ENCFF547MET/@@download/ENCFF547MET.bed.gz
+  fileNameBlacklisted <- "ENCFF547MET.bed.gz"
+  annot <- "mm10" # for QCmetrics
+  organism <- "mmu" # for enrichKEGG
+  gene_annotations <- grcm38[ !(grepl("_", grcm38$chr) | grepl("GL", grcm38$chr)), c("ensgene", "symbol", "biotype", "description")]
+  gene_annotations <- gene_annotations[ !duplicated(gene_annotations) & !is.na(gene_annotations$symbol), ]
+  # for biomaRt
+  mart <- useMart("ensembl", dataset="mmusculus_gene_ensembl")
+  gene_symbol <- 'mgi_symbol' 
+}
+```
+
+## File names
+
+```{r}
+# Suffix for file names
+# suffix <- "HSJHD"
+# suffix <- "LANMYC"
+# suffix <- "SYBRG"
+suffix <- "SAN"
+# List of all BAM files
+sortedBAM <- list.files(path = file.path(dir_data, "03_bowtie2_sub/"), pattern = ".bam$", full.names = TRUE)
+sortedBAM <- sortedBAM[grepl(paste0(suffix, "_DAC[123]|", suffix, "_CTL[123]"), sortedBAM)]
+# Get sample names from BAM filenames
+bamNames <- basename(sortedBAM) %>% str_remove("_sorted_noDups_filt_noMT.bam")
+# Convert bed to BED
+# for file in *.bed; do echo $file; cut -f1-5 ${file} > tmp.bed; mv tmp.bed ${file}; done
+# List of all peak files
+peaksbeds <- list.files(path = file.path(dir_data, "05_macs2/"), pattern = "_peaks_filt.broadPeak", full.names = TRUE)
+peaksbeds <- peaksbeds[grepl(paste0(suffix, "_DAC|", suffix, "_CTL"), peaksbeds)]
+# Get peak names from bed filenames
+peakNames <- basename(peaksbeds) %>% str_remove("_peaks_filt.broadPeak")
+# Check if the order is equal
+all.equal(bamNames, peakNames)
+# Blacklisted
+blkList <- import.bed(fileNameBlacklisted)
+# Group vector
+Group <- bamNames %>% str_remove("[0-9]_S[0-9]+$") %>% factor()
+# Sample annotation data frame
+sample_annotation <- data.frame(Sample = peakNames, Group = as.character(Group))
+
+# Filenames
+fileNameOut1 <- file.path("results", paste0(suffix, "_propmapped.csv")) # Number of mapped reads
+fileNameOut2 <- file.path("results", paste0(suffix, "_regionPlot.RData")) # Plotting ChIP-seq signal of TSSs
+fileNameOut3 <- file.path("results", paste0(suffix, "_QCmetrics.RData"))  # QC for low quality, duplicates and signal distribution
+fileNameOut4 <- file.path("results", paste0(suffix, "_Peaks_annotated.xlsx")) # Save peaks
+if (run_promoters) {
+  fileNameOut5 <- file.path("results", paste0(suffix, "_countsFromPromoters.xlsx")) # Counting for differential promoters
+  fileNameOut6 <- file.path("results", paste0(suffix, "_ATACseq_", ifelse(up_dn_separate, "updn", "all"), "_", p_adj_cutoff, "_Promoters.xlsx")) 
+  fileNameOut7 <- file.path("results", paste0(suffix, "_DESeq2_Promoters.RData")) # Full DESeq2 results as GRanges object
+  } else {
+  fileNameOut5 <- file.path("results", paste0(suffix, "_countsFromPeaks.xlsx")) # Counting for differential ATAC-seq peaks
+  fileNameOut6 <- file.path("results", paste0(suffix, "_ATACseq_", ifelse(up_dn_separate, "updn", "all"), "_", p_adj_cutoff, "_Peaks.xlsx")) 
+  fileNameOut7 <- file.path("results", paste0(suffix, "_DESeq2_Peaks.RData")) # Full DESeq2 results as GRanges object
+}
+```
+
+# Diagnostics
+
+## Number of mapped reads
+
+The number of mapped, unmapped reads, and mapping percentage
+
+```{r}
+if (file.exists(fileNameOut1) & !rerun) {
+  pmapped <- read_csv(file = fileNameOut1)
+} else {
+  unlink(fileNameOut1)
+  # Proportion mapped
+  pmapped <- propmapped(sortedBAM)
+  write_csv(data.frame(file = rownames(pmapped), pmapped), file = fileNameOut1)
+}
+
+kable(pmapped)
+```
+
+## Distribution of mapped reads
+
+```{r fig.height=8, fig.width=10}
+plot_list <- list()
+for (i in 1:length(sortedBAM)) {
+  plot_list <- c(plot_list, list(idxstatsBam(file = sortedBAM[i], index = sortedBAM[i]) %>% head(n = 25) %>% ggplot(aes(seqnames, mapped, fill = seqnames)) + geom_bar(stat = "identity") + coord_flip() + theme(legend.position = "none") + ggtitle(bamNames[i])))
+}
+
+grid.arrange(grobs = plot_list, ncol = 3)
+```
+
+# Peak statistics
+
+## QC for low quality, duplicates and signal distribution
+
+- **Reads** - Total reads in bam file
+- **Map%** - Percentage of total reads mapping within file.
+- **Filt%** - Percentage of mapped reads passing MapQ filter.
+- **Dup%** - Percentage of mapped reads marked as duplicates.
+- **ReadL** - Mean read length (as integer).
+- **FragL** - Predicted fragmentlength by cross-coverage method.
+- **RelCC** - The relative cross-coverage score
+- **SSD** - Standardised standard deviation
+- **RiP%** - Reads mapped to peaks
+- **RiBL%** - Reads mapped to blacklists
+
+```{r message=FALSE, warning=FALSE, results='hide'}
+if (file.exists(fileNameOut3) & !rerun) {
+  load(file = fileNameOut3)
+} else {
+  unlink(fileNameOut3)
+  # Get QC for all samples
+  qcRes_list <- list()
+  for (i in 1:length(sortedBAM)) {
+    qcRes <- ChIPQCsample(sortedBAM[i], peaks = peaksbeds[i], annotation = annot, chromosomes = autosomes, blacklist = fileNameBlacklisted, verboseT = FALSE)
+    qcRes_list <- c(qcRes_list, list(qcRes))
+  }
+  # Save QC for all samples
+  save(qcRes_list, file = fileNameOut3)
+}
+# qcRes_list[[1]]@PropInFeatures %>% unlist()
+# QCmetrics(qcRes_list[[1]]@AveragePeakSignal) %>% t %>% data.frame  %>% datatable(colnames = bamNames)
+
+# flagtagcounts(qcRes) %>% t %>% data.frame %>% mutate(Dup_Percent = (DuplicateByChIPQC/Mapped) * 
+#     100) %>% dplyr:::select(Mapped, Dup_Percent) %>% datatable(rownames = NULL)
+```
+
+## Remove blacklisted peaks
+
+Create `MacsCalls_filtered_list` with peaks sans blacklisted regions
+
+```{r}
+MacsCalls_filtered_list <- list()
+for (i in 1:length(qcRes_list)) {
+  print(bamNames[i])
+  MacsCalls <- granges(qcRes_list[[i]])
+  data.frame(Blacklisted = sum(MacsCalls %over% blkList), Not_Blacklisted = sum(!MacsCalls %over% blkList))
+  MacsCalls_filtered <- MacsCalls[!MacsCalls %over% blkList]
+  # Drop non-canonical chromosomes
+  seqlevels(MacsCalls_filtered, pruning.mode = "tidy") <- autosomes
+  MacsCalls_filtered_list <- c(MacsCalls_filtered_list, list(MacsCalls_filtered))
+}
+```
+
+## Annotating peaks to genes
+
+```{r message=FALSE, warning=FALSE}
+MacsCalls_filteredAnno_list <- list()
+for (i in 1:length(MacsCalls_filtered_list)) {
+  print(bamNames[i])
+  MacsCalls_filtered <- MacsCalls_filtered_list[[i]]
+  MacsCalls_filteredAnno <- annotatePeak(MacsCalls_filtered, TxDb = TxDb)
+  MacsCalls_filteredAnno_list <- c(MacsCalls_filteredAnno_list, list(MacsCalls_filteredAnno))
+}
+```
+
+## Piecharts of annotation distribution
+
+```{r fig.height=3}
+for (i in 1:length(MacsCalls_filteredAnno_list)) {
+  print(bamNames[i])
+  MacsCalls_filteredAnno <- MacsCalls_filteredAnno_list[[i]]
+  plotAnnoPie(MacsCalls_filteredAnno) 
+  #plotAnnoBar(MacsCalls_filteredAnno)
+}
+```
+
+```{r eval=FALSE}
+## Visualising overlaps between genomic regions
+for (i in 1:length(MacsCalls_filteredAnno_list)) {
+  print(bamNames[i])
+  MacsCalls_filteredAnno <- MacsCalls_filteredAnno_list[[i]]
+  upsetplot(MacsCalls_filteredAnno)
+}
+```
+
+## Barplots of annotation distribution
+
+```{r fig.height=5, fig.width=6}
+# Get annotation statistics for each sample
+annoStat_list <- list()
+for (i in 1:length(MacsCalls_filteredAnno_list)) {
+    annoStat_list <- c(annoStat_list, list(MacsCalls_filteredAnno_list[[i]]@annoStat))
+}
+# Combine
+annoStat_summary <- annoStat_list %>% purrr::reduce(full_join, by = "Feature")
+colnames(annoStat_summary) <- c("Feature", bamNames)
+# Reshape
+annoStat_summary_long <- reshape2::melt(annoStat_summary, id = "Feature")
+colnames(annoStat_summary_long) <- c("Feature", "Group", "Percent")
+annoStat_summary_long$Group <- gsub("[0-9]","", annoStat_summary_long$Group)
+# Summarize
+annoStat_summary_long %>% group_by(Feature, Group) %>% summarise(mean = mean(Percent)) %>% pander()
+# Change order
+annoStat_summary_long$Group <- factor(annoStat_summary_long$Group)
+# Plot
+ggplot(annoStat_summary_long, aes(x=Group, y=Percent, fill=Group)) +
+  geom_boxplot(position=position_dodge(1))+
+  facet_wrap(~ Feature, scales = "free")
+# ggsave("results/Figure_annotation_distributions.tiff", width = 7, height = 6, dpi = 300, compression = "lzw")
+ggsave(file.path("results", paste0(suffix, "_Figure_annotation_distributions.png")), width = 7, height = 5, dpi = 600)
+```
+
+## Save peaks
+
+```{r}
+if (!file.exists(fileNameOut4) | rerun) {
+  unlink(fileNameOut4)
+  x <- list()
+  for (i in 1:length(MacsCalls_filteredAnno_list)) {
+    # Remove dot part from Ensembl transcripts
+    ensgene <- sapply(MacsCalls_filteredAnno_list[[i]]@anno@elementMetadata@listData$transcriptId, function(x) strsplit(x, ".", fixed = TRUE)[[1]][1])
+    # Annotate with BiomaRt
+    ensgene_annotated <- getBM(attributes=c('ensembl_transcript_id', gene_symbol,'description'), 
+                   filters='ensembl_transcript_id', values=ensgene, mart=mart, uniqueRows=T)
+    # Aggregate to unique values
+    funx <- function(x) {paste(unique(x), collapse = ":")}
+    ensgene_annotated <- aggregate(ensgene_annotated, list(ensgene_annotated$ensembl_transcript_id), funx)
+    colnames(ensgene_annotated)[1] <- "ensgene"
+    # Merge with original transcripts
+    genes <- data.frame(ensgene = ensgene)
+    genes <- left_join(genes, ensgene_annotated, by = c("ensgene" = "ensgene"))
+    # Convert csAnno to GRanges
+    Macs_gr <- as.GRanges(MacsCalls_filteredAnno_list[[i]])
+    # Append annotations
+    Macs_gr$gene_symbol <- genes[, gene_symbol]
+    Macs_gr$description <- genes[, "description"]
+    x <- c(x, list(as.data.frame(Macs_gr)))
+  }
+  # Add names
+  names(x) <- bamNames
+  # Save the data
+  write_xlsx(x, path = fileNameOut4)
+}
+```
+
+# Differential ChIP-seq
+
+## Identifying a set of non-redundant peaks
+
+```{r}
+# Get peaks as a list of GRanges
+myPeaks <- lapply(peaksbeds, ChIPQC:::GetGRanges, simple = TRUE)
+names(myPeaks) <- bamNames
+# Get consensus peak matrix
+testRanges = GRangesList(myPeaks) # %>% unlist() %>% reduce()
+# testRanges_SAF <- data.frame(GeneID = paste0(seqnames(testRanges), ":", start(testRanges), "-", end(testRanges)),
+#                              Chr = seqnames(testRanges),
+#                              Start = start(testRanges),
+#                              End = end(testRanges),
+#                              Strand = ".")
+# consensusToCount <- Rsubread::featureCounts(files = sortedBAM[1:2], annot.ext = testRanges_SAF[1:100, ])
+
+class(testRanges) <- "GRangesList"
+consensusToCount <- soGGi:::runConsensusRegions(testRanges, method = "none")
+# Keep canonical chromosomes sans chrM
+seqlevels(consensusToCount, pruning.mode = "tidy") <- autosomes[autosomes != "chrM"]
+# Remove blacklisted regions
+consensusToCount <- consensusToCount[!consensusToCount %over% blkList & !seqnames(consensusToCount) %in% "chrM"]
+```
+
+## Overlap of peaks among replicates
+
+```{r fig.height=4, fig.width=6}
+par(mfrow = c(1, 2)) # Create a 1 x 2 plotting matrix
+for (i in 1:length(levels(Group))) {
+  group_selected <- levels(Group)[i]
+  as.data.frame(elementMetadata(consensusToCount)) %>% dplyr::select(matches(paste0("^", group_selected, "[0-9]") )) %>% 
+    vennDiagram(main = paste0("Overlap for ", group_selected, " open regions"))
+}
+par(mfrow = c(1, 1))
+```
+
+## PCA of overlaps (occupancy analysis)
+
+```{r fig.height=3, fig.width=4}
+mtx_to_plot <- as.data.frame(elementMetadata(consensusToCount)) %>% dplyr::select(-consensusIDs) %>% 
+    as.matrix %>% t %>% prcomp %>% .$x %>% data.frame %>% mutate(Samples = rownames(.)) %>% 
+    mutate(Group = Group)
+
+ggplot(mtx_to_plot, aes(x = PC1, y = PC2, colour = Group, label = Samples)) + 
+  geom_point(size = 3) + 
+  geom_text_repel(colour = "black", size = 3)
+```
+
+## Counting for differential ChIP-seq
+
+```{r}
+if (run_promoters) {
+  # Promoter granges
+  promoters_txdb <- promoters(genes(TxDb), upstream = upstream, downstream = dnstream)
+  promoters_txdb <- keepStandardChromosomes(promoters_txdb, pruning.mode = "coarse")
+  promoters_txdb <- sort(promoters_txdb)
+  write_tsv(as.data.frame(promoters_txdb)[, c("seqnames", "start", "end", "gene_id", "width", "strand")], paste0("results/promoters_", annot, ".bed"), col_names = FALSE)
+  # Peaks
+  consensusToCount <- promoters_txdb
+  # Promoter counts
+  if (file.exists(fileNameOut5) & !rerun) {
+    myCounts <- read_xlsx(fileNameOut5)
+    myCountsIDs <- myCounts$ID
+    myCounts <- as.matrix(myCounts[, colnames(myCounts) != "ID"])
+    rownames(myCounts) <- myCountsIDs
+  } else {
+    unlink(fileNameOut5)
+    # indexBam(sortedBAM)
+    regionsToCount <- data.frame(GeneID = consensusToCount$gene_id, 
+                                 Chr = as.character(seqnames(consensusToCount)), 
+                                 Start = start(consensusToCount), 
+                                 End = end(consensusToCount), 
+                                 Strand = strand(consensusToCount))
+    fcResults <- featureCounts(sortedBAM, annot.ext = regionsToCount, isPairedEnd = pairedend, 
+        countMultiMappingReads = FALSE, maxFragLength = 100, nthreads = threads)
+    all.equal(as.character(fcResults$annotation$GeneID), names(consensusToCount))
+    myCounts <- fcResults$counts
+    colnames(myCounts) <- peakNames
+    # Gene symbols for entrezIDs
+    # entrez_to_gene <- mapIds(org.Hs.eg.db, rownames(myCounts), "SYMBOL", "ENTREZID")
+    # entrez_to_gene <- data.frame(gene_id = names(entrez_to_gene),
+    #                              symbol  = entrez_to_gene)
+    # all.equal(rownames(myCounts), entrez_to_gene$gene_id)
+    # all.equal(consensusToCount$gene_id, entrez_to_gene$gene_id)
+    # rownames(myCounts) <- entrez_to_gene$symbol
+    # names(consensusToCount) <- entrez_to_gene$symbol
+    write_xlsx(x = data.frame(ID = rownames(myCounts), myCounts), path = fileNameOut5)
+  }
+} else {
+  # ChIP peaks counts
+  if (file.exists(fileNameOut5) & !rerun) {
+    myCounts <- read_xlsx(fileNameOut5)
+    myCountsIDs <- myCounts$ID
+    myCounts <- as.matrix(myCounts[, colnames(myCounts) != "ID"])
+    rownames(myCounts) <- myCountsIDs
+  } else {
+    # Filtering peaks occurring in less than 2 samples
+    occurrences <- elementMetadata(consensusToCount) %>% as.data.frame %>% dplyr::select(-consensusIDs) %>% rowSums
+    table(occurrences) %>% rev %>% cumsum
+    consensusToCount <- consensusToCount[occurrences > 2, ]
+    unlink(fileNameOut5)
+    # indexBam(sortedBAM)
+    regionsToCount <- data.frame(GeneID = paste("ID", seqnames(consensusToCount), 
+        start(consensusToCount), end(consensusToCount), sep = "_"), Chr = seqnames(consensusToCount), 
+        Start = start(consensusToCount), End = end(consensusToCount), Strand = strand(consensusToCount))
+    fcResults <- featureCounts(sortedBAM, annot.ext = regionsToCount, isPairedEnd = pairedend, 
+        countMultiMappingReads = FALSE, maxFragLength = 100, nthreads = threads)
+    myCounts <- fcResults$counts
+    colnames(myCounts) <- peakNames
+    write_xlsx(x = data.frame(ID = rownames(myCounts), myCounts), path = fileNameOut5)
+  }
+}
+```
+
+# Analysis 1
+
+```{r}
+# Subset the data, adjust manually
+# index <- sample_annotation$Group == "S" | sample_annotation$Group == "M" 
+# Or, use all the data
+index <- sample_annotation$Group == sample_annotation$Group
+sample_annotation_subset <- sample_annotation[index, ]
+counts_subset <- myCounts[, index]
+all.equal(sample_annotation_subset$Sample, colnames(counts_subset))
+
+# Adjust manually
+sample_annotation_subset$Group <- factor(sample_annotation_subset$Group)
+sample_annotation_subset$Group <- relevel(sample_annotation_subset$Group, ref = paste0(suffix, "_CTL"))
+
+atacDDS <- DESeqDataSetFromMatrix(counts_subset, sample_annotation_subset, ~Group, rowRanges = consensusToCount)
+atacDDS <- DESeq(atacDDS)
+print("Size factors")
+sizeFactors(atacDDS)
+# atac_Rlog <- rlog(atacDDS)
+# plotPCA(atac_Rlog, intgroup = "Group", ntop = nrow(atac_Rlog))
+
+res.full <- results(atacDDS, c("Group", paste0(suffix, "_DAC"), paste0(suffix, "_CTL")), format = "GRanges")
+res.full <- res.full[order(res.full$pvalue)]
+res.full <- res.full[!is.na(res.full$padj), ]
+# Save the full results
+save(res.full, file = fileNameOut7)
+```
+
+## Visualize top 10 differential peaks
+
+To observe the correspondence of "log2FoldChange" to the directionality of changes between conditions.
+
+```{r}
+res.full %>% as.data.frame() %>% head() %>% datatable() 
+```
+
+```{r}
+mtx_selected <- counts_subset[names(res.full)[1:10], ]
+colnames(mtx_selected) <- sample_annotation_subset$Group
+mtx_to_plot <- reshape2::melt(mtx_selected)
+colnames(mtx_to_plot) <- c("Regions", "Condition", "Count")
+mtx_to_plot$Regions <- factor(mtx_to_plot$Regions, levels = names(res.full)[1:10])
+# mtx_to_plot %>% group_by(Regions, Condition) %>% summarise(mean = mean(Count))
+ggplot(mtx_to_plot, aes(x = Regions, y = Count, fill = Condition)) +
+  geom_boxplot() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+## Annotation
+
+### By ChIPseeker annotations
+
+```{r}
+# Get annotations
+anno_res.full <- annotatePeak(res.full, TxDb = TxDb, tssRegion = c(-1 * upstream, dnstream), level = "transcript", overlap = "TSS")
+# Summary of annotations
+annotation_types <- colnames(anno_res.full@detailGenomicAnnotation)
+for (i in annotation_types) {
+  print(i)
+  print(table(anno_res.full@detailGenomicAnnotation[, i]))
+}
+# Save the results
+anno_res.full.gr <- as.GRanges(anno_res.full)
+save(anno_res.full.gr, file = file.path("memes", paste0(suffix, "_anno_res_full.RData")))
+
+# Separate into promoter-specific and distal
+# Process promoters, if present
+if (sum(anno_res.full@detailGenomicAnnotation$Promoter) > 0) {
+  anno_res.promoter <- subset(anno_res.full, anno_res.full@detailGenomicAnnotation$Promoter)
+  # Convert to GRanges
+  anno_res.promoter.gr <- as.GRanges(anno_res.promoter)
+  # Annotate into Static, Increasing, Decreasing
+  print("Promoter peak classification")
+  ifelse(anno_res.promoter.gr$padj > p_adj_cutoff, "Static", ifelse(anno_res.promoter.gr$log2FoldChange > 0,  "Increasing", "Decreasing")) %>% table()
+  anno_res.promoter.gr$Status <- ifelse(anno_res.promoter.gr$pvalue > p_adj_cutoff, "Static", ifelse(anno_res.promoter.gr$log2FoldChange > 0,  "Increasing", "Decreasing"))
+  # Save objects
+  save(anno_res.promoter.gr, file = file.path("memes", paste0(suffix, "_anno_res_promoter.RData")))
+}
+
+# Process intergenic, if present
+if (sum(anno_res.full@detailGenomicAnnotation$distal_intergenic) > 0) {
+  anno_res.distal <- subset(anno_res.full, anno_res.full@detailGenomicAnnotation$distal_intergenic)
+  anno_res.distal.gr <- as.GRanges(anno_res.distal)
+  print("Distal peak classification")
+  ifelse(anno_res.distal.gr$padj > p_adj_cutoff, "Static", ifelse(anno_res.distal.gr$log2FoldChange > 0,  "Increasing", "Decreasing")) %>% table()
+  anno_res.distal.gr$Status <- ifelse(anno_res.distal.gr$pvalue > p_adj_cutoff, "Static", ifelse(anno_res.distal.gr$log2FoldChange > 0,  "Increasing", "Decreasing"))
+  save(anno_res.distal.gr, file = file.path("memes", paste0(suffix, "_anno_res_distal.RData")))
+}
+```
+
+### By promoter overlaps (not used)
+
+```{r eval=FALSE}
+# Define promoters
+toOverLap <- promoters(TxDb, upstream, dnstream)
+print(paste0("Number of significantly different peaks: ", length(res.full)))
+# Filter
+res.full <- res.full[ res.full %over% toOverLap, ]
+print(paste0("Number of significantly different peaks AND in promoters: ", length(res.full[res.full %over% toOverLap, ]) ))
+```
+
+
+## Filtering
+
+```{r}
+if (sum(res.full$padj < p_adj_cutoff) > 0 ) {
+  print(paste("Filtering by adjusted p-value, FDR", p_adj_cutoff))
+  # Filter by p_adj_cutoff
+  res.filtered <- res.full[(res.full$padj < p_adj_cutoff) & !is.na(res.full$padj), ]
+} else {
+  print(paste("Filtering by raw p-value", p_val_cutoff))
+  # Filter by p_adj_cutoff
+  res.filtered <- res.full[(res.full$pvalue < p_val_cutoff) & !is.na(res.full$pvalue), ]
+}
+print(paste("Number of filtered peaks", length(res.filtered)))
+# Append ID
+res.filtered$ID = names(res.filtered)
+# New annotation object with filtered results
+anno_res.filtered <- annotatePeak(res.filtered, TxDb = TxDb, tssRegion = c(-1 * upstream, dnstream), level = "transcript", overlap = "TSS")
+
+# Filter
+# If no promoter annotations, use all but intergenic
+if (sum(anno_res.filtered@detailGenomicAnnotation$Promoter) == 0) {
+  anno_res.filtered <- subset(anno_res.filtered, !anno_res.filtered@detailGenomicAnnotation$Intergenic)
+} else {
+  # If promoter annotation present, use it
+  anno_res.filtered <- subset(anno_res.filtered, anno_res.filtered@detailGenomicAnnotation$Promoter)
+}
+
+print(paste0("Number of significantly different peaks AND in promoters: ", anno_res.filtered@peakNum ))
+print(paste0("Number of significantly different peaks AND in promoters AND up: ", sum(anno_res.filtered@anno$log2FoldChange > 0) ))
+print(paste0("Number of significantly different peaks AND in promoters AND dn: ", sum(anno_res.filtered@anno$log2FoldChange <= 0) ))
+```
+
+## Select differential peaks around the promoters
+
+### Check if anything significant
+
+```{r}
+if (anno_res.filtered@peakNum <= min_genes) {
+  run_enrichment <- FALSE
+} else {
+  run_enrichment <- TRUE
+}
+# run_enrichment <- FALSE
+```
+
+## Functional Analysis using clusterProfiler
+
+```{r}
+if (run_enrichment) {
+  # Up/Dn separate peak analysis
+  if( up_dn_separate ) {
+    go1 <- enrichGO(as.data.frame(as.GRanges(anno_res.filtered)[as.GRanges(anno_res.filtered)$log2FoldChange > 
+    0])$geneId, OrgDb = OrgDb, ont = "BP", maxGSSize = 5000)
+    go2 <- enrichGO(as.data.frame(as.GRanges(anno_res.filtered)[as.GRanges(anno_res.filtered)$log2FoldChange < 
+        0])$geneId, OrgDb = OrgDb, ont = "BP", maxGSSize = 5000)
+    # Check if 
+    if (!is.null(go1)){
+      print("ClusterProfiler Gene Ontology Biological Processes for UP peaks")
+      head(go1, 10) %>% dplyr::select(ID, Description, pvalue, p.adjust) %>% datatable(elementId = "goEle1")
+    } else {
+      print("ClusterProfiler Gene Ontology Biological Processes for UP peaks - nothing significant")
+      go1 <- data.frame(Results = c("Nothing significant"))
+    }
+    if (!is.null(go2)){
+      print("ClusterProfiler Gene Ontology Biological Processes for DN peaks")
+      head(go2, 10) %>% dplyr::select(ID, Description, pvalue, p.adjust) %>% datatable(elementId = "goEle1")
+    } else {
+      print("ClusterProfiler Gene Ontology Biological Processes for DN peaks - nothing significant")
+      go2 <- data.frame(Results = c("Nothing significant"))
+    }
+    
+    kegg1 <- enrichKEGG(as.data.frame(as.GRanges(anno_res.filtered)[as.GRanges(anno_res.filtered)$log2FoldChange > 
+        0])$geneId, organism = organism)
+    kegg2 <- enrichKEGG(as.data.frame(as.GRanges(anno_res.filtered)[as.GRanges(anno_res.filtered)$log2FoldChange < 
+        0])$geneId, organism = organism)
+    
+    if (!is.null(kegg1)){
+      print("ClusterProfiler KEGG pathways for UP peaks")
+      head(kegg1@result, 10) %>% dplyr::select(ID, Description, pvalue, p.adjust) %>% datatable(elementId = "goEle1")
+    } else {
+      print("ClusterProfiler KEGG pathways for UP peaks - nothing significant")
+      kegg1 <- data.frame(Results = c("Nothing significant"))
+    }
+    if (!is.null(kegg2)){
+      print("ClusterProfiler KEGG pathways for DN peaks")
+      head(kegg2@result, 10) %>% dplyr::select(ID, Description, pvalue, p.adjust) %>% datatable(elementId = "goEle1")
+    } else {
+      print("ClusterProfiler KEGG pathways for DN peaks - nothing significant")
+      kegg2 <- data.frame(Results = c("Nothing significant"))
+    }
+
+  # All peak analysis
+  } else {
+    go1 <- enrichGO(as.data.frame(as.GRanges(anno_res.filtered))$geneId, OrgDb = OrgDb, ont = "BP", maxGSSize = 5000)
+    # Check if 
+    if (!is.null(go1)){
+      print("ClusterProfiler Gene Ontology Biological Processes for ALL peaks")
+      head(go1, 10) %>% dplyr::select(ID, Description, pvalue, p.adjust) %>% datatable(elementId = "goEle1")
+    } else {
+      go1 <- data.frame(Results = c("Nothing significant"))
+    }
+    
+    kegg1 <- enrichKEGG(as.data.frame(as.GRanges(anno_res.filtered))$geneId, organism = organism)
+
+    if (!is.null(kegg1)){
+      print("ClusterProfiler KEGG pathways for ALL peaks")
+      head(kegg1, 10) %>% dplyr::select(ID, Description, pvalue, p.adjust) %>% datatable(elementId = "goEle1")
+    } else {
+      kegg1 <- data.frame(Results = c("Nothing significant"))
+    }
+  }
+
+}
+```
+
+## Functional Analysis using GREAT
+
+```{r message=FALSE, warning=FALSE}
+if (run_enrichment) {
+  # Perform GREAT GOBP analysis on GRanges
+  # Provide peaks as GRanges
+  getGreatResults <- function(annot_res.full_gr) {
+    seqlevelsStyle(anno_res.filtered_gr) <- "UCSC"
+    great_Job <- submitGreatJob(anno_res.filtered_gr, species = annot, max_tries = 1)
+    # availableCategories(great_Job)
+    great_ResultTable = getEnrichmentTables(great_Job, category = "GO")
+    # names(great_ResultTable)
+    great_ResultTable[["GO Biological Process"]]
+  }
+  
+  # Up/Dn separate peak analysis
+  if( up_dn_separate ) {
+    anno_res.filtered_gr <- as.GRanges(anno_res.filtered)[as.GRanges(anno_res.filtered)$log2FoldChange > 0]
+    if (length(anno_res.filtered_gr) > 0) {
+      great1 <- getGreatResults(anno_res.filtered_gr)
+      great1 <- great1[great1$Binom_Adjp_BH < p_adj_cutoff, , drop = FALSE]
+      print("GREAT Gene Ontology Biological Processes for UP peaks")
+      head(great1, 10) %>% dplyr::select(ID, name, Binom_Raw_PValue, Binom_Adjp_BH) %>% datatable(elementId = "goEle1")
+    } else {
+      great1 <- data.frame(Results = c("Nothing significant"))
+    }
+    
+    # Wait 1 min
+    Sys.sleep(60)
+    # Downregulated peaks
+    anno_res.filtered_gr <- as.GRanges(anno_res.filtered)[as.GRanges(anno_res.filtered)$log2FoldChange < 0]
+    if (length(anno_res.filtered_gr) > 0) {
+      great2 <- getGreatResults(anno_res.filtered_gr)
+      great2 <- great2[great2$Binom_Adjp_BH < p_adj_cutoff, , drop = FALSE]
+      print("GREAT Gene Ontology Biological Processes for DN peaks")
+      head(great2, 10) %>% dplyr::select(ID, name, Binom_Raw_PValue, Binom_Adjp_BH) %>% datatable(elementId = "goEle1")
+    } else {
+      great2 <- data.frame(Results = c("Nothing significant"))
+    }
+  
+  # All peak analysis
+  } else {
+    anno_res.filtered_gr <- as.GRanges(anno_res.filtered)
+    if (length(anno_res.filtered_gr) > 0) {
+      great1 <- getGreatResults(anno_res.filtered_gr)
+      great1 <- great1[great1$Binom_Adjp_BH < p_adj_cutoff, , drop = FALSE]
+      print("GREAT Gene Ontology Biological Processes for ALL peaks")
+      head(great1, 10) %>% dplyr::select(ID, name, Binom_Raw_PValue, Binom_Adjp_BH) %>% datatable(elementId = "goEle1")
+    } else {
+      great1 <- data.frame(Results = c("Nothing significant"))
+    }
+  }
+}
+```
+
+## Export annotated, differential ChIP-seq peaks
+
+```{r}
+# if (!run_enrichment) {
+  # Convert to GRanges
+  anno_res.filtered_GRanges <- as.GRanges(anno_res.filtered)
+  # Remove dot part from Ensembl transcripts
+  ensgene <- sapply(anno_res.filtered_GRanges$transcriptId, function(x) strsplit(x, ".", fixed = TRUE)[[1]][1]) %>% unname()
+  # Annotate with BiomaRt
+  ensgene_annotated <- getBM(attributes=c('ensembl_transcript_id', gene_symbol,'description'), 
+                 filters='ensembl_transcript_id', values=ensgene, mart=mart, uniqueRows=T)
+  # Aggregate to unique values
+  funx <- function(x) {paste(unique(x), collapse = ":")}
+  ensgene_annotated <- aggregate(ensgene_annotated, list(ensgene_annotated$ensembl_transcript_id), funx)
+  colnames(ensgene_annotated)[1] <- "ensgene"
+  # Merge with original transcripts
+  genes <- data.frame(ensgene = ensgene)
+  genes <- left_join(genes, ensgene_annotated, by = c("ensgene" = "ensgene"))
+  # Sanity check
+  all.equal(genes$ensgene, ensgene)
+  # Append annotations
+  if (nrow(genes) == length(anno_res.filtered_GRanges)) {
+    anno_res.filtered_GRanges$gene_symbol <- genes[, gene_symbol]
+    anno_res.filtered_GRanges$description <- genes[, "description"]
+  }
+# }
+```
+
+## Collect data
+
+```{r}
+x1 <- list(as.data.frame(anno_res.filtered_GRanges))
+names(x1) <- c("Analysis1")
+
+if (run_enrichment) {
+  if (up_dn_separate) {
+    x1 <- c(x1, list(as.data.frame(kegg1@result)), list(as.data.frame(kegg2@result)), list(as.data.frame(go1)), list(as.data.frame(go2)), list(great1), list(great2)) # 
+    names(x1) <- c("Analysis1", "KEGG1_UP", "KEGG1_DN", "GOBP1_UP", "GOBP1_DN", "GREAT1_UP", "GREAT1_DN") # 
+  } else {
+    x1 <- c(list(as.data.frame(anno_res.filtered_GRanges)), list(as.data.frame(kegg1@result)), list(as.data.frame(go1))) # , list(great1)
+    names(x1) <- c("Analysis1", "KEGG1_ALL", "GOBP1_ALL") # , "GREAT1_ALL"
+  }
+} else {
+  names(x1) <- c("Analysis1")
+}
+
+```
+
+
+# Save the results
+
+```{r}
+x <- x1 
+write_xlsx(x, path = fileNameOut6)
+```
+

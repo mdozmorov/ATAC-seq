@@ -51,6 +51,10 @@ Check and adjust each script for the environment and tool names.
   - Input: `02_bowtie2` folder with sorted and indexed `_sorted.bam` files.
   - Output: `02_bowtie2` folder with sorted properly paired reads, chrM cleaned `_sorted_filt_noTM.bam` files. The original sorted and indexed BAM files, and intermediate ones, are deleted to save space.
 
+- [04a_qc_qualimap.sh](04a_qc_qualimap.sh) - [Qualimap](http://qualimap.conesalab.org/) quality control. Runs multi-bamqc on a file with "Sample ID", "BAM path", and "Group ID" columns (need adjustment). Requires `qualimap` environment
+  - Input: `02_bowtie2` folder with sorted and indexed `.bam` files.
+  - Output: `02_bowtie2_qualimap` folder with `multisampleBamQcReport.html` report.
+
 - [04a_complexity_flagstat.sh](04a_complexity_flagstat.sh) - calculate rescaling factors from flagstat stats. Requires `bowtie2` environment.
   - Input: `02_bowtie2` folder with sorted properly paired reads, chrM cleaned `_sorted_filt_noTM.bam` files.
   - Output: `02_bowtie2_flagstat` with `flagstat*` files with all statistics and `scaling*` files with scaling factors only.
@@ -82,6 +86,8 @@ Check and adjust each script for the environment and tool names.
 - [07b_peak_macs2_pooled.sh](07b_peak_macs2_pooled.sh) - calling pooled peaks and selecting those overlapping with individual replicates at least 50%. Uses [naiveOverlapBroad.sh](naiveOverlapBroad.sh) for two replicates and [naiveOverlapBroad3.sh](naiveOverlapBroad3.sh) for three replicates. Need to be manually edited.
   - Input: `04_bedpe` folder with `*_minimal.bedpe` files. `05_macs2` folder with MACS2 output and `*_filt.broadPeak` filtered broadpeak files.
   - Output: `05_macs2` folder with `*_overlap_peaks_filt.broadPeak` files.
+
+- [Analysis_ATAC-seq.Rmd](Analysis_ATAC-seq.Rmd) - R workflow for ATAC-seq analysis. QC, differential peak analysis and annotation. Many input, intermediate, and output files 
 
 # ATAC-seq (original README)
 
